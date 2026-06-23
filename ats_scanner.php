@@ -1393,13 +1393,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $p2MaxField = $isTech ? 30 : 50;
 
             // Pillar 2 tenure score calculation for this field
-            if ($tenureYears >= 6) {
-                $p2ScoreField = $p2MaxField;
-            } elseif ($tenureYears >= 3) {
-                $p2ScoreField = $isTech ? 20 : 35;
+            // Technical fields: steep decay ($p2Score = round(30 * (1 - exp(-0.32 * $Y)))), capped at 20 years (30 pts max)
+            // Non-technical fields: flatter decay ($p2Score = round(50 * (1 - exp(-0.16 * $Y)))), capped at 20 years (50 pts max)
+            $Y = min($tenureYears, 20);
+            if ($isTech) {
+                $p2ScoreField = ($Y >= 20) ? 30 : (int)round(30 * (1 - exp(-0.32 * $Y)));
             } else {
-                $p2ScoreField = $isTech ? 10 : 20;
+                $p2ScoreField = ($Y >= 20) ? 50 : (int)round(50 * (1 - exp(-0.16 * $Y)));
             }
+
 
             $activeKws = $fieldKws;
             if ($field === $identifiedField && isset($roleMatrices[$identifiedRole])) {
@@ -2234,32 +2236,29 @@ $scoreLabel = get_score_label($atsScore);
             <div class="bar-track"><div class="bar-fill keywords" style="width:<?php echo ($winningPillar2 / $p2Max) * 100; ?>%"></div></div>
         </div>
         <div id="rubric-p2" class="rubric-dropdown">
-            <div class="rubric-section-title">Experience Tiers</div>
+            <div class="rubric-section-title">Longevity Points Milestones</div>
             <ul class="rubric-list">
-                <li class="rubric-item <?php echo ($tenureYears >= 6) ? 'matched' : 'unmatched'; ?>">
+                <?php 
+                $milestones = [1, 3, 6, 10, 15, 20];
+                foreach ($milestones as $mYr):
+                    // Calculate points at this milestone year using the active curve
+                    $isTech = ($identifiedField === 'Technology & Engineering');
+                    if ($isTech) {
+                        $mPts = ($mYr >= 20) ? 30 : (int)round(30 * (1 - exp(-0.32 * $mYr)));
+                    } else {
+                        $mPts = ($mYr >= 20) ? 50 : (int)round(50 * (1 - exp(-0.16 * $mYr)));
+                    }
+                    $isMilestoneReached = ($tenureYears >= $mYr);
+                ?>
+                <li class="rubric-item <?php echo $isMilestoneReached ? 'matched' : 'unmatched'; ?>">
                     <div class="rubric-item-header">
-                        <span class="rubric-badge <?php echo ($tenureYears >= 6) ? 'matched' : 'unmatched'; ?>">
-                            <?php echo ($tenureYears >= 6) ? '✓ Active' : 'Tier'; ?>
+                        <span class="rubric-badge <?php echo $isMilestoneReached ? 'matched' : 'unmatched'; ?>">
+                            <?php echo $isMilestoneReached ? '✓ Reached' : 'Milestone'; ?>
                         </span>
-                        <strong>Senior Tier (6+ Years)</strong> — <?php echo $p2Max; ?> points
+                        <strong><?php echo $mYr; ?> Year<?php echo $mYr > 1 ? 's' : ''; ?> Mark</strong> — <?php echo $mPts; ?> points
                     </div>
                 </li>
-                <li class="rubric-item <?php echo ($tenureYears >= 3 && $tenureYears < 6) ? 'matched' : 'unmatched'; ?>">
-                    <div class="rubric-item-header">
-                        <span class="rubric-badge <?php echo ($tenureYears >= 3 && $tenureYears < 6) ? 'matched' : 'unmatched'; ?>">
-                            <?php echo ($tenureYears >= 3 && $tenureYears < 6) ? '✓ Active' : 'Tier'; ?>
-                        </span>
-                        <strong>Mid Tier (3-5 Years)</strong> — <?php echo ($p2Max === 30 ? 20 : 35); ?> points
-                    </div>
-                </li>
-                <li class="rubric-item <?php echo ($tenureYears < 3) ? 'matched' : 'unmatched'; ?>">
-                    <div class="rubric-item-header">
-                        <span class="rubric-badge <?php echo ($tenureYears < 3) ? 'matched' : 'unmatched'; ?>">
-                            <?php echo ($tenureYears < 3) ? '✓ Active' : 'Tier'; ?>
-                        </span>
-                        <strong>Junior Tier (<3 Years)</strong> — <?php echo ($p2Max === 30 ? 10 : 20); ?> points
-                    </div>
-                </li>
+                <?php endforeach; ?>
             </ul>
 
             <div class="rubric-section-title" style="margin-top: 14px;">Extracted Longevity (<?php echo $tenureYears; ?> Years)</div>
