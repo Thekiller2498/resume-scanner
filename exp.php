@@ -1599,6 +1599,58 @@ function getResumeSections(string $text): array {
 }
 
 /**
+ * Map the structured JSON emitted by the browser spatial PDF extractor
+ * directly into the $sections array and pre-parsed $parsedExp/$parsedEdu arrays.
+ */
+function mapStructuredJsonToSections(array $structured): array {
+    $secs = $structured['sections'] ?? [];
+    $sections = [];
+
+    foreach (['skills', 'summary', 'projects', 'certifications', 'culture'] as $key) {
+        if (!empty($secs[$key])) {
+            $sections[$key] = $secs[$key];
+        }
+    }
+
+    if (!empty($secs['education_text'])) {
+        $sections['education'] = $secs['education_text'];
+    }
+
+    $parsedExp = [];
+    if (!empty($secs['experience']) && is_array($secs['experience'])) {
+        foreach ($secs['experience'] as $job) {
+            $parsedExp[] = [
+                'role'      => trim($job['role'] ?? ''),
+                'company'   => trim($job['company'] ?? ''),
+                'dates'     => trim($job['dates'] ?? ''),
+                'reference' => '',
+                'bullets'   => array_map('trim', $job['bullets'] ?? []),
+            ];
+        }
+    }
+
+    $resumeText = $structured['_plainText'] ?? '';
+    if (empty($resumeText)) {
+        $parts = [];
+        if (!empty($structured['header'])) $parts[] = $structured['header'];
+        foreach ($sections as $key => $text) {
+            $parts[] = strtoupper($key) . "\n" . $text;
+        }
+        foreach ($parsedExp as $job) {
+            $parts[] = implode("\n", array_filter([$job['company'], $job['role'], $job['dates']]));
+            foreach ($job['bullets'] as $b) $parts[] = '• ' . $b;
+        }
+        $resumeText = implode("\n\n", $parts);
+    }
+
+    return [
+        'sections'   => $sections,
+        'parsedExp'  => $parsedExp,
+        'resumeText' => $resumeText,
+    ];
+}
+
+/**
  * Extract degrees, universities, and grades from education text block.
  */
 function parseEducation(string $eduText): array {
@@ -1935,8 +1987,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $uploadedPdfName = htmlspecialchars(basename($file['name']));
 
                 // Check if browser-extracted text is provided via POST
+                $structuredJson = null;  // will hold decoded spatial JSON if browser sent it
                 if (isset($_POST['extracted_text']) && strlen(trim($_POST['extracted_text'])) > 20) {
-                    $resumeText = $_POST['extracted_text'];
+                    $rawExtracted = $_POST['extracted_text'];
+                    // Detect structured spatial JSON from the upgraded browser extractor
+                    if (isset($rawExtracted[0]) && $rawExtracted[0] === '{') {
+                        $decoded = @json_decode($rawExtracted, true);
+                        if ($decoded && isset($decoded['sections'])) {
+                            $structuredJson = $decoded;
+                            // Use the embedded plain text for text-based analyses
+                            $resumeText = $decoded['_plainText'] ?? '';
+                        }
+                    }
+                    if ($structuredJson === null) {
+                        $resumeText = $rawExtracted;
+                    }
                 } else {
                     // Attempt 1: Poppler pdftotext executable
                     $resumeText = tryPdfToText($file['tmp_name']);
@@ -2017,13 +2082,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         // B. Parse sections and details
-        $sections = getResumeSections($resumeText);
-        $parsedEdu = isset($sections['education']) ? parseEducation($sections['education']) : [];
-        $parsedExp = isset($sections['experience']) ? parseExperience($sections['experience']) : [];
-        $parsedProj = isset($sections['projects']) ? parseProjects($sections['projects']) : [];
-        $parsedCert = isset($sections['certifications']) ? parseCertifications($sections['certifications']) : [];
-        $parsedSkills = isset($sections['skills']) ? parseSkills($sections['skills']) : [];
-        $parsedCulture = isset($sections['culture']) ? parseCulture($sections['culture']) : [];
+        if (!empty($structuredJson)) {
+            $mapped      = mapStructuredJsonToSections($structuredJson);
+            $sections    = $mapped['sections'];
+            $parsedExp   = $mapped['parsedExp'];
+            if (!empty($mapped['resumeText'])) {
+                $resumeText      = $mapped['resumeText'];
+                $lowercaseText   = strtolower($resumeText);
+                $lines           = explode("\n", trim($resumeText));
+            }
+        } else {
+            $sections  = getResumeSections($resumeText);
+            $parsedExp = isset($sections['experience']) ? parseExperience($sections['experience']) : [];
+        }
+        $parsedEdu    = isset($sections['education'])      ? parseEducation($sections['education'])         : [];
+        $parsedProj   = isset($sections['projects'])       ? parseProjects($sections['projects'])           : [];
+        $parsedCert   = isset($sections['certifications']) ? parseCertifications($sections['certifications']): [];
+        $parsedSkills = isset($sections['skills'])         ? parseSkills($sections['skills'])               : [];
+        $parsedCulture= isset($sections['culture'])        ? parseCulture($sections['culture'])             : [];
 
         // C. Calculate general tenure years first (score is calculated dynamically per field)
         $tenureYears = estimateTenure($resumeText);
@@ -3413,8 +3489,212 @@ $scoreLabel = get_score_label($atsScore);
     // Configure PDF.js worker
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
 
+    // ── Spatial PDF Extraction ──────────────────────────────────────────────
+    // Replaces the flat Y-threshold text approach. Collects all text tokens
+    // with their exact (x, y, fontSize) coordinates, groups them into visual
+    // rows, detects section headers, and emits a structured JSON blob so the
+    // PHP parser can skip fragile regex-based section splitting entirely.
+    // ────────────────────────────────────────────────────────────────────────
+
+    const DATE_RANGE_RE = /(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2})?[\s\/\-]*(?:19\d\d|20[0-4]\d)\s*(?:–|—|-|to)\s*(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2})?[\s\/\-]*(?:20[0-4]\d)|present|current|now)/i;
+    const BULLET_RE     = /^[\u2022\u2023\u2043\u204B\u25CF\u25AA\u25E6\u2B25\u2022\u274F\u27A2\u2714\u2713\u2012\u2013\u2014\uE000-\uF8FF•\-*●▪◦■♦★✦❖>]\s*(.*)/u;
+
+    const SECTION_PATTERNS = [
+        { re: /^(?:PROFESSIONAL\s+)?SUMMARY$/i,                           key: 'summary'        },
+        { re: /^ABOUT\s+ME$/i,                                             key: 'summary'        },
+        { re: /^OBJECTIVE$/i,                                              key: 'summary'        },
+        { re: /^(?:WORK\s+|PROFESSIONAL\s+|EMPLOYMENT\s+)?EXPERIENCE$/i,  key: 'experience'     },
+        { re: /^WORK\s+HISTORY$/i,                                         key: 'experience'     },
+        { re: /^CAREER\s+HISTORY$/i,                                       key: 'experience'     },
+        { re: /^LEADERSHIP(?:\s+(?:&|AND)\s+ACTIVITIES)?$/i,              key: 'experience'     },
+        { re: /^(?:PROFESSIONAL\s+|ACADEMIC\s+)?EDUCATION$/i,             key: 'education'      },
+        { re: /^ACADEMIC\s+BACKGROUND$/i,                                  key: 'education'      },
+        { re: /^(?:.*?\s+)?PROJECTS$/i,                                    key: 'projects'       },
+        { re: /^(?:.*?\s+)?CERTIFICATIONS?$/i,                             key: 'certifications' },
+        { re: /^CREDENTIALS$/i,                                             key: 'certifications' },
+        { re: /^LICENSES$/i,                                                key: 'certifications' },
+        { re: /^(?:TECHNICAL\s+|KEY\s+)?SKILLS?$/i,                       key: 'skills'         },
+        { re: /^(?:.*?\s+)?TECHNOLOGIES$/i,                                key: 'skills'         },
+        { re: /^(?:.*?\s+)?(?:INTERESTS|HOBBIES|VOLUNTEERING?|COMMUNITY|ACTIVITIES|CAMPUS\s+INVOLVEMENT)$/i, key: 'culture' },
+    ];
+
+    function detectSectionKey(text) {
+        const t = text.trim();
+        for (const { re, key } of SECTION_PATTERNS) {
+            if (re.test(t)) return key;
+        }
+        return null;
+    }
+
+    function pageItemsToRows(items, pageHeight) {
+        const tokens = [];
+        for (const item of items) {
+            const str = item.str;
+            if (!str || !str.trim()) continue;
+            const x  = item.transform[4];
+            const y  = pageHeight - item.transform[5];
+            const fs = item.height || item.transform[0] || 10;
+            tokens.push({ str, x, y, fs });
+        }
+        if (tokens.length === 0) return [];
+        tokens.sort((a, b) => a.y - b.y || a.x - b.x);
+        const rows = [];
+        let curRow = null;
+        for (const tok of tokens) {
+            if (!curRow || Math.abs(tok.y - curRow.y) > 4) {
+                curRow = { y: tok.y, maxFs: tok.fs, tokens: [tok] };
+                rows.push(curRow);
+            } else {
+                if (tok.fs > curRow.maxFs) curRow.maxFs = tok.fs;
+                curRow.tokens.push(tok);
+            }
+        }
+        for (const row of rows) {
+            row.tokens.sort((a, b) => a.x - b.x);
+            let text = '';
+            let prevX = null, prevW = null;
+            for (const tok of row.tokens) {
+                if (prevX !== null) {
+                    const gap = tok.x - (prevX + (prevW || 0));
+                    text += (gap > 60) ? '  ' : ' ';
+                }
+                text += tok.str;
+                prevX = tok.x;
+                prevW = tok.str.length * tok.fs * 0.5;
+            }
+            row.text = text.trim();
+        }
+        return rows;
+    }
+
+    function parseExpRows(rows) {
+        const jobs = [];
+        let cur = null;
+        for (let ri = 0; ri < rows.length; ri++) {
+            const text = rows[ri].text.trim();
+            if (!text) continue;
+            const dateMatch = text.match(DATE_RANGE_RE);
+            if (dateMatch) {
+                if (cur) jobs.push(cur);
+                const dateStr = dateMatch[0].trim();
+                let roleStr = text.replace(dateStr, '').trim().replace(/^[\s|,\-–—]+|[\s|,\-–—]+$/g, '');
+                let company = '';
+                for (let back = ri - 1; back >= 0; back--) {
+                    const prev = rows[back].text.trim();
+                    if (!prev) continue;
+                    if (DATE_RANGE_RE.test(prev) || BULLET_RE.test(prev)) break;
+                    company = prev;
+                    break;
+                }
+                cur = { role: roleStr, company, dates: dateStr, bullets: [] };
+            } else if (cur) {
+                const bulletMatch = text.match(BULLET_RE);
+                if (bulletMatch) {
+                    cur.bullets.push(bulletMatch[1].trim());
+                } else {
+                    let nextHasDate = false;
+                    for (let fwd = ri + 1; fwd < rows.length; fwd++) {
+                        const nxt = rows[fwd].text.trim();
+                        if (!nxt) continue;
+                        if (DATE_RANGE_RE.test(nxt)) { nextHasDate = true; }
+                        break;
+                    }
+                    if (nextHasDate) continue;
+                    if (cur.bullets.length > 0) {
+                        cur.bullets[cur.bullets.length - 1] += ' ' + text;
+                    }
+                }
+            }
+        }
+        if (cur) jobs.push(cur);
+        return jobs;
+    }
+
+    function buildResumeText(structured) {
+        const parts = [];
+        if (structured.header)          parts.push(structured.header);
+        if (structured.sections.summary)        parts.push('SUMMARY\n' + structured.sections.summary);
+        if (structured.sections.skills)         parts.push('SKILLS\n' + structured.sections.skills);
+        if (structured.sections.certifications) parts.push('CERTIFICATIONS\n' + structured.sections.certifications);
+        if (structured.sections.experience && structured.sections.experience.length > 0) {
+            parts.push('EXPERIENCE');
+            for (const j of structured.sections.experience) {
+                parts.push([j.company, j.role, j.dates].filter(Boolean).join('\n'));
+                for (const b of j.bullets) parts.push('• ' + b);
+            }
+        }
+        if (structured.sections.education_text) parts.push('EDUCATION\n' + structured.sections.education_text);
+        if (structured.sections.projects)        parts.push('PROJECTS\n'  + structured.sections.projects);
+        if (structured.sections.culture)         parts.push(structured.sections.culture);
+        return parts.join('\n\n');
+    }
+
+    async function extractStructuredFromPdf(pdf) {
+        let allRows     = [];
+        let cumulativeY = 0;
+        for (let p = 1; p <= pdf.numPages; p++) {
+            const page     = await pdf.getPage(p);
+            const viewport = page.getViewport({ scale: 1.0 });
+            const tc       = await page.getTextContent();
+            const pageRows = pageItemsToRows(tc.items, viewport.height);
+            for (const row of pageRows) {
+                allRows.push({ ...row, y: row.y + cumulativeY });
+            }
+            cumulativeY += viewport.height + 20;
+        }
+        if (allRows.length === 0) return null;
+
+        const fsSorted = allRows.map(r => r.maxFs).sort((a,b) => a - b);
+        const medianFs = fsSorted[Math.floor(fsSorted.length / 2)];
+
+        for (const row of allRows) {
+            const t = row.text.trim();
+            const secKey = detectSectionKey(t);
+            if (secKey) {
+                row.sectionKey = secKey;
+            } else if (t.length > 0 && t.length < 50 && row.maxFs >= medianFs * 1.15 && t === t.toUpperCase()) {
+                row.sectionKey = '__heading__';
+            }
+        }
+
+        const buckets     = {};
+        let curSection    = null;
+        const headerLines = [];
+
+        for (const row of allRows) {
+            if (row.sectionKey) {
+                if (row.sectionKey !== '__heading__') {
+                    if (curSection !== row.sectionKey) {
+                        curSection = row.sectionKey;
+                        if (!buckets[curSection]) buckets[curSection] = [];
+                    }
+                }
+                continue;
+            }
+            if (!curSection) {
+                headerLines.push(row.text);
+            } else {
+                buckets[curSection].push(row);
+            }
+        }
+
+        const structured = { header: headerLines.join('\n'), sections: {} };
+
+        if (buckets.experience) {
+            structured.sections.experience = parseExpRows(buckets.experience);
+        }
+        if (buckets.education) {
+            structured.sections.education_text = buckets.education.map(r => r.text).join('\n');
+        }
+        for (const key of ['skills', 'summary', 'projects', 'certifications', 'culture']) {
+            if (buckets[key]) {
+                structured.sections[key] = buckets[key].map(r => r.text).join('\n');
+            }
+        }
+        return structured;
+    }
+
     form.addEventListener('submit', async (e) => {
-        // If we already extracted the text and set it, let the form submit normally
         if (document.getElementById('extracted-text-input').value.length > 20) {
             return;
         }
@@ -3437,25 +3717,40 @@ $scoreLabel = get_score_label($atsScore);
                 try {
                     const typedarray = new Uint8Array(this.result);
                     const pdf = await pdfjsLib.getDocument({ data: typedarray }).promise;
+
+                    let structured = null;
+                    try {
+                        structured = await extractStructuredFromPdf(pdf);
+                    } catch (spatialErr) {
+                        console.warn('Spatial extraction failed, falling back to flat text:', spatialErr);
+                    }
+
+                    if (structured) {
+                        const plainText = buildResumeText(structured);
+                        if (plainText.trim().length > 20) {
+                            structured._plainText = plainText;
+                            const jsonPayload = JSON.stringify(structured);
+                            document.getElementById('extracted-text-input').value = jsonPayload;
+                            btn.textContent = '⏳ Analyzing...';
+                            form.submit();
+                            return;
+                        }
+                    }
+
+                    // Fallback: flat-text extraction
                     let fullText = '';
-                    
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
                         const textContent = await page.getTextContent();
                         let pageText = '';
                         let lastY = null;
-                        
                         for (const item of textContent.items) {
-                            const trimmedStr = item.str; // keep original spacing, check empty
-                            if (trimmedStr.trim() === '') continue;
-                            
+                            const str = item.str;
+                            if (!str.trim()) continue;
                             const y = item.transform[5];
-                            if (lastY !== null && Math.abs(y - lastY) > 5) {
-                                pageText += '\n';
-                            } else if (lastY !== null) {
-                                pageText += ' ';
-                            }
-                            pageText += trimmedStr;
+                            if (lastY !== null && Math.abs(y - lastY) > 5) pageText += '\n';
+                            else if (lastY !== null) pageText += ' ';
+                            pageText += str;
                             lastY = y;
                         }
                         fullText += pageText + '\n\n';

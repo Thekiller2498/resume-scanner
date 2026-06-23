@@ -1599,6 +1599,68 @@ function getResumeSections(string $text): array {
 }
 
 /**
+ * Map the structured JSON emitted by the browser spatial PDF extractor
+ * directly into the $sections array and pre-parsed $parsedExp/$parsedEdu arrays.
+ *
+ * Returns an array: [
+ *   'sections'    => [...],        // keyed text sections
+ *   'parsedExp'   => [...],        // structured job entries (already parsed)
+ *   'resumeText'  => '...',        // reconstructed plain-text for metrics/tenure
+ * ]
+ */
+function mapStructuredJsonToSections(array $structured): array {
+    $secs = $structured['sections'] ?? [];
+    $sections = [];
+
+    // Plain text sections that PHP parsers still need as raw text
+    foreach (['skills', 'summary', 'projects', 'certifications', 'culture'] as $key) {
+        if (!empty($secs[$key])) {
+            $sections[$key] = $secs[$key];
+        }
+    }
+
+    // Education stays as raw text so parseEducation() can run on it
+    if (!empty($secs['education_text'])) {
+        $sections['education'] = $secs['education_text'];
+    }
+
+    // Map pre-structured experience jobs into parsedExp format
+    $parsedExp = [];
+    if (!empty($secs['experience']) && is_array($secs['experience'])) {
+        foreach ($secs['experience'] as $job) {
+            $parsedExp[] = [
+                'role'      => trim($job['role'] ?? ''),
+                'company'   => trim($job['company'] ?? ''),
+                'dates'     => trim($job['dates'] ?? ''),
+                'reference' => '',
+                'bullets'   => array_map('trim', $job['bullets'] ?? []),
+            ];
+        }
+    }
+
+    // Use the pre-built plain text if available, otherwise reconstruct
+    $resumeText = $structured['_plainText'] ?? '';
+    if (empty($resumeText)) {
+        $parts = [];
+        if (!empty($structured['header'])) $parts[] = $structured['header'];
+        foreach ($sections as $key => $text) {
+            $parts[] = strtoupper($key) . "\n" . $text;
+        }
+        foreach ($parsedExp as $job) {
+            $parts[] = implode("\n", array_filter([$job['company'], $job['role'], $job['dates']]));
+            foreach ($job['bullets'] as $b) $parts[] = '• ' . $b;
+        }
+        $resumeText = implode("\n\n", $parts);
+    }
+
+    return [
+        'sections'   => $sections,
+        'parsedExp'  => $parsedExp,
+        'resumeText' => $resumeText,
+    ];
+}
+
+/**
  * Extract degrees, universities, and grades from education text block.
  */
 function parseEducation(string $eduText): array {
@@ -1926,8 +1988,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $uploadedPdfName = htmlspecialchars(basename($file['name']));
 
                 // Check if browser-extracted text is provided via POST
+                $structuredJson = null;  // will hold decoded spatial JSON if browser sent it
                 if (isset($_POST['extracted_text']) && strlen(trim($_POST['extracted_text'])) > 20) {
-                    $resumeText = $_POST['extracted_text'];
+                    $rawExtracted = $_POST['extracted_text'];
+                    // Detect structured spatial JSON from the upgraded browser extractor
+                    if (isset($rawExtracted[0]) && $rawExtracted[0] === '{') {
+                        $decoded = @json_decode($rawExtracted, true);
+                        if ($decoded && isset($decoded['sections'])) {
+                            $structuredJson = $decoded;
+                            // Use the embedded plain text for text-based analyses
+                            $resumeText = $decoded['_plainText'] ?? '';
+                        }
+                    }
+                    if ($structuredJson === null) {
+                        $resumeText = $rawExtracted;
+                    }
                 } else {
                     // Attempt 1: Poppler pdftotext executable
                     $resumeText = tryPdfToText($file['tmp_name']);
@@ -2008,13 +2083,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         // B. Parse sections and details
-        $sections = getResumeSections($resumeText);
-        $parsedEdu = isset($sections['education']) ? parseEducation($sections['education']) : [];
-        $parsedExp = isset($sections['experience']) ? parseExperience($sections['experience']) : [];
-        $parsedProj = isset($sections['projects']) ? parseProjects($sections['projects']) : [];
-        $parsedCert = isset($sections['certifications']) ? parseCertifications($sections['certifications']) : [];
-        $parsedSkills = isset($sections['skills']) ? parseSkills($sections['skills']) : [];
-        $parsedCulture = isset($sections['culture']) ? parseCulture($sections['culture']) : [];
+        // If the browser sent structured spatial JSON, map it directly (skips fragile regex section splitting
+        // and the flat parseExperience parser which caused job-bleed issues).
+        if (!empty($structuredJson)) {
+            $mapped      = mapStructuredJsonToSections($structuredJson);
+            $sections    = $mapped['sections'];
+            $parsedExp   = $mapped['parsedExp'];  // already structured — no parseExperience() needed
+            // Resume text may have been enriched; keep the mapped version as authoritative
+            if (!empty($mapped['resumeText'])) {
+                $resumeText      = $mapped['resumeText'];
+                $lowercaseText   = strtolower($resumeText);
+                $lines           = explode("\n", trim($resumeText));
+            }
+        } else {
+            $sections  = getResumeSections($resumeText);
+            $parsedExp = isset($sections['experience']) ? parseExperience($sections['experience']) : [];
+        }
+        // These parsers run regardless of path (education/projects/skills always come from text)
+        $parsedEdu    = isset($sections['education'])      ? parseEducation($sections['education'])         : [];
+        $parsedProj   = isset($sections['projects'])       ? parseProjects($sections['projects'])           : [];
+        $parsedCert   = isset($sections['certifications']) ? parseCertifications($sections['certifications']): [];
+        $parsedSkills = isset($sections['skills'])         ? parseSkills($sections['skills'])               : [];
+        $parsedCulture= isset($sections['culture'])        ? parseCulture($sections['culture'])             : [];
 
         // C. Calculate general tenure years first (score is calculated dynamically per field)
         $tenureYears = estimateTenure($resumeText);
@@ -3404,6 +3494,260 @@ $scoreLabel = get_score_label($atsScore);
     // Configure PDF.js worker
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
 
+    // ── Spatial PDF Extraction ──────────────────────────────────────────────
+    // Replaces the flat Y-threshold text approach. Collects all text tokens
+    // with their exact (x, y, fontSize) coordinates, groups them into visual
+    // rows, detects section headers, and emits a structured JSON blob so the
+    // PHP parser can skip fragile regex-based section splitting entirely.
+    // ────────────────────────────────────────────────────────────────────────
+
+    const DATE_RANGE_RE = /(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2})?[\s\/\-]*(?:19\d\d|20[0-4]\d)\s*(?:–|—|-|to)\s*(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2})?[\s\/\-]*(?:20[0-4]\d)|present|current|now)/i;
+    const BULLET_RE     = /^[\u2022\u2023\u2043\u204B\u25CF\u25AA\u25E6\u2B25\u2022\u274F\u27A2\u2714\u2713\u2012\u2013\u2014\uE000-\uF8FF•\-*●▪◦■♦★✦❖>]\s*(.*)/u;
+
+    const SECTION_PATTERNS = [
+        { re: /^(?:PROFESSIONAL\s+)?SUMMARY$/i,                           key: 'summary'        },
+        { re: /^ABOUT\s+ME$/i,                                             key: 'summary'        },
+        { re: /^OBJECTIVE$/i,                                              key: 'summary'        },
+        { re: /^(?:WORK\s+|PROFESSIONAL\s+|EMPLOYMENT\s+)?EXPERIENCE$/i,  key: 'experience'     },
+        { re: /^WORK\s+HISTORY$/i,                                         key: 'experience'     },
+        { re: /^CAREER\s+HISTORY$/i,                                       key: 'experience'     },
+        { re: /^LEADERSHIP(?:\s+(?:&|AND)\s+ACTIVITIES)?$/i,              key: 'experience'     },
+        { re: /^(?:PROFESSIONAL\s+|ACADEMIC\s+)?EDUCATION$/i,             key: 'education'      },
+        { re: /^ACADEMIC\s+BACKGROUND$/i,                                  key: 'education'      },
+        { re: /^(?:.*?\s+)?PROJECTS$/i,                                    key: 'projects'       },
+        { re: /^(?:.*?\s+)?CERTIFICATIONS?$/i,                             key: 'certifications' },
+        { re: /^CREDENTIALS$/i,                                             key: 'certifications' },
+        { re: /^LICENSES$/i,                                                key: 'certifications' },
+        { re: /^(?:TECHNICAL\s+|KEY\s+)?SKILLS?$/i,                       key: 'skills'         },
+        { re: /^(?:.*?\s+)?TECHNOLOGIES$/i,                                key: 'skills'         },
+        { re: /^(?:.*?\s+)?(?:INTERESTS|HOBBIES|VOLUNTEERING?|COMMUNITY|ACTIVITIES|CAMPUS\s+INVOLVEMENT)$/i, key: 'culture' },
+    ];
+
+    function detectSectionKey(text) {
+        const t = text.trim();
+        for (const { re, key } of SECTION_PATTERNS) {
+            if (re.test(t)) return key;
+        }
+        return null;
+    }
+
+    // Parse a page's getTextContent items into spatial rows
+    function pageItemsToRows(items, pageHeight) {
+        // Collect tokens with flipped Y (PDF Y goes bottom-up; flip to top-down)
+        const tokens = [];
+        for (const item of items) {
+            const str = item.str;
+            if (!str || !str.trim()) continue;
+            const x  = item.transform[4];
+            const y  = pageHeight - item.transform[5]; // top-down
+            const fs = item.height || item.transform[0] || 10;
+            tokens.push({ str, x, y, fs });
+        }
+
+        if (tokens.length === 0) return [];
+
+        // Sort top-down, then left-right
+        tokens.sort((a, b) => a.y - b.y || a.x - b.x);
+
+        // Group tokens into rows (Y within ±4pt)
+        const rows = [];
+        let curRow = null;
+        for (const tok of tokens) {
+            if (!curRow || Math.abs(tok.y - curRow.y) > 4) {
+                curRow = { y: tok.y, maxFs: tok.fs, tokens: [tok] };
+                rows.push(curRow);
+            } else {
+                if (tok.fs > curRow.maxFs) curRow.maxFs = tok.fs;
+                curRow.tokens.push(tok);
+            }
+        }
+
+        // Sort tokens within each row left-to-right
+        for (const row of rows) {
+            row.tokens.sort((a, b) => a.x - b.x);
+            // Build row text; insert extra space if there's a large X-gap (column separator)
+            let text = '';
+            let prevX = null, prevW = null;
+            for (const tok of row.tokens) {
+                if (prevX !== null) {
+                    const gap = tok.x - (prevX + (prevW || 0));
+                    text += (gap > 60) ? '  ' : ' ';   // double-space = column break hint
+                }
+                text += tok.str;
+                prevX = tok.x;
+                prevW = tok.str.length * tok.fs * 0.5; // rough char width estimate
+            }
+            row.text = text.trim();
+        }
+
+        return rows;
+    }
+
+    // Parse experience rows into structured job entries
+    function parseExpRows(rows) {
+        const jobs = [];
+        let cur = null;
+
+        for (let ri = 0; ri < rows.length; ri++) {
+            const text = rows[ri].text.trim();
+            if (!text) continue;
+
+            const dateMatch = text.match(DATE_RANGE_RE);
+
+            if (dateMatch) {
+                if (cur) jobs.push(cur);
+
+                const dateStr  = dateMatch[0].trim();
+                // Role = everything on this line that isn't the date
+                let roleStr = text.replace(dateStr, '').trim().replace(/^[\s|,\-–—]+|[\s|,\-–—]+$/g, '');
+
+                // Company: look back for the first non-bullet non-date non-empty line
+                let company = '';
+                for (let back = ri - 1; back >= 0; back--) {
+                    const prev = rows[back].text.trim();
+                    if (!prev) continue;
+                    if (DATE_RANGE_RE.test(prev) || BULLET_RE.test(prev)) break;
+                    company = prev;
+                    break;
+                }
+
+                cur = { role: roleStr, company, dates: dateStr, bullets: [] };
+            } else if (cur) {
+                const bulletMatch = text.match(BULLET_RE);
+                if (bulletMatch) {
+                    cur.bullets.push(bulletMatch[1].trim());
+                } else {
+                    // Non-bullet, non-date line inside a job:
+                    // Could be a wrapped bullet, an address line, or company of next job.
+                    // If the NEXT row has a date range, this is the company of the next entry → skip.
+                    let nextHasDate = false;
+                    for (let fwd = ri + 1; fwd < rows.length; fwd++) {
+                        const nxt = rows[fwd].text.trim();
+                        if (!nxt) continue;
+                        if (DATE_RANGE_RE.test(nxt)) { nextHasDate = true; }
+                        break;
+                    }
+                    if (nextHasDate) continue; // upcoming company name — skip appending
+
+                    // Otherwise append to last bullet (wrapped line) or ignore
+                    if (cur.bullets.length > 0) {
+                        cur.bullets[cur.bullets.length - 1] += ' ' + text;
+                    }
+                }
+            }
+        }
+        if (cur) jobs.push(cur);
+        return jobs;
+    }
+
+    // Build a plain-text reconstruction from structured data (for PHP fallback usage)
+    function buildResumeText(structured) {
+        const parts = [];
+        if (structured.header)          parts.push(structured.header);
+        if (structured.sections.summary)        parts.push('SUMMARY\n' + structured.sections.summary);
+        if (structured.sections.skills)         parts.push('SKILLS\n' + structured.sections.skills);
+        if (structured.sections.certifications) parts.push('CERTIFICATIONS\n' + structured.sections.certifications);
+        if (structured.sections.experience && structured.sections.experience.length > 0) {
+            parts.push('EXPERIENCE');
+            for (const j of structured.sections.experience) {
+                parts.push([j.company, j.role, j.dates].filter(Boolean).join('\n'));
+                for (const b of j.bullets) parts.push('• ' + b);
+            }
+        }
+        if (structured.sections.education_text) parts.push('EDUCATION\n' + structured.sections.education_text);
+        if (structured.sections.projects)        parts.push('PROJECTS\n'  + structured.sections.projects);
+        if (structured.sections.culture)         parts.push(structured.sections.culture);
+        return parts.join('\n\n');
+    }
+
+    async function extractStructuredFromPdf(pdf) {
+        // Collect all rows from all pages (Y offset by page)
+        let allRows      = [];
+        let cumulativeY  = 0;
+
+        for (let p = 1; p <= pdf.numPages; p++) {
+            const page       = await pdf.getPage(p);
+            const viewport   = page.getViewport({ scale: 1.0 });
+            const tc         = await page.getTextContent();
+            const pageRows   = pageItemsToRows(tc.items, viewport.height);
+
+            // Offset Y by cumulative page height so pages stack vertically
+            for (const row of pageRows) {
+                allRows.push({ ...row, y: row.y + cumulativeY });
+            }
+            cumulativeY += viewport.height + 20; // 20pt gap between pages
+        }
+
+        if (allRows.length === 0) return null;
+
+        // Compute median font-size (used to detect headings)
+        const fsSorted = allRows.map(r => r.maxFs).sort((a,b) => a - b);
+        const medianFs = fsSorted[Math.floor(fsSorted.length / 2)];
+
+        // Assign section keys to header rows
+        for (const row of allRows) {
+            const t = row.text.trim();
+            const secKey = detectSectionKey(t);
+            // A row is a heading if it matches a section pattern, OR if it's short + large font
+            if (secKey) {
+                row.sectionKey = secKey;
+            } else if (t.length > 0 && t.length < 50 && row.maxFs >= medianFs * 1.15 && t === t.toUpperCase()) {
+                // ALL CAPS large font → treat as unlabelled heading (skip content)
+                row.sectionKey = '__heading__';
+            }
+        }
+
+        // Bucket rows into sections
+        const buckets     = {};
+        let curSection    = null;
+        const headerLines = [];
+
+        for (const row of allRows) {
+            if (row.sectionKey) {
+                if (row.sectionKey !== '__heading__') {
+                    // Merge duplicate section types (e.g. two experience sections)
+                    if (curSection === row.sectionKey) {
+                        // same section continues — don't reset
+                    } else {
+                        curSection = row.sectionKey;
+                        if (!buckets[curSection]) buckets[curSection] = [];
+                    }
+                }
+                // Don't add the heading row itself to bucket content
+                continue;
+            }
+            if (!curSection) {
+                headerLines.push(row.text);
+            } else {
+                buckets[curSection].push(row);
+            }
+        }
+
+        const structured = {
+            header:   headerLines.join('\n'),
+            sections: {}
+        };
+
+        // Experience → structured jobs array
+        if (buckets.experience) {
+            structured.sections.experience = parseExpRows(buckets.experience);
+        }
+
+        // Education → raw text (PHP still parses this with existing parseEducation())
+        if (buckets.education) {
+            structured.sections.education_text = buckets.education.map(r => r.text).join('\n');
+        }
+
+        // Skills, summary, projects, certifications, culture → raw text
+        for (const key of ['skills', 'summary', 'projects', 'certifications', 'culture']) {
+            if (buckets[key]) {
+                structured.sections[key] = buckets[key].map(r => r.text).join('\n');
+            }
+        }
+
+        return structured;
+    }
+
     form.addEventListener('submit', async (e) => {
         // If we already extracted the text and set it, let the form submit normally
         if (document.getElementById('extracted-text-input').value.length > 20) {
@@ -3428,25 +3772,43 @@ $scoreLabel = get_score_label($atsScore);
                 try {
                     const typedarray = new Uint8Array(this.result);
                     const pdf = await pdfjsLib.getDocument({ data: typedarray }).promise;
+
+                    // Try structured spatial extraction first
+                    let structured = null;
+                    try {
+                        structured = await extractStructuredFromPdf(pdf);
+                    } catch (spatialErr) {
+                        console.warn('Spatial extraction failed, falling back to flat text:', spatialErr);
+                    }
+
+                    if (structured) {
+                        // Reconstruct plain text for PHP's text-based analyses (tenure, metrics, etc.)
+                        const plainText = buildResumeText(structured);
+                        if (plainText.trim().length > 20) {
+                            // Embed plain text in the structured JSON so PHP has both
+                            structured._plainText = plainText;
+                            const jsonPayload = JSON.stringify(structured);
+                            document.getElementById('extracted-text-input').value = jsonPayload;
+                            btn.textContent = '⏳ Analyzing...';
+                            form.submit();
+                            return;
+                        }
+                    }
+
+                    // Fallback: flat-text extraction (original approach)
                     let fullText = '';
-                    
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
                         const textContent = await page.getTextContent();
                         let pageText = '';
                         let lastY = null;
-                        
                         for (const item of textContent.items) {
-                            const trimmedStr = item.str; // keep original spacing, check empty
-                            if (trimmedStr.trim() === '') continue;
-                            
+                            const str = item.str;
+                            if (!str.trim()) continue;
                             const y = item.transform[5];
-                            if (lastY !== null && Math.abs(y - lastY) > 5) {
-                                pageText += '\n';
-                            } else if (lastY !== null) {
-                                pageText += ' ';
-                            }
-                            pageText += trimmedStr;
+                            if (lastY !== null && Math.abs(y - lastY) > 5) pageText += '\n';
+                            else if (lastY !== null) pageText += ' ';
+                            pageText += str;
                             lastY = y;
                         }
                         fullText += pageText + '\n\n';
