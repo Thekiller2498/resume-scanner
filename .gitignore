@@ -1,0 +1,4 @@
+poppler/
+*.pdf
+test_debug.php
+test_regex.php
