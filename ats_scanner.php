@@ -1882,8 +1882,23 @@ $scoreLabel = get_score_label($atsScore);
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
                         const textContent = await page.getTextContent();
-                        const pageText = textContent.items.map(item => item.str).join(' ');
-                        fullText += pageText + '\n';
+                        let pageText = '';
+                        let lastY = null;
+                        
+                        for (const item of textContent.items) {
+                            const trimmedStr = item.str; // keep original spacing, check empty
+                            if (trimmedStr.trim() === '') continue;
+                            
+                            const y = item.transform[5];
+                            if (lastY !== null && Math.abs(y - lastY) > 5) {
+                                pageText += '\n';
+                            } else if (lastY !== null) {
+                                pageText += ' ';
+                            }
+                            pageText += trimmedStr;
+                            lastY = y;
+                        }
+                        fullText += pageText + '\n\n';
                     }
 
                     if (fullText.trim().length > 20) {
