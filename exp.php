@@ -599,12 +599,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 $uploadedPdfName = htmlspecialchars(basename($file['name']));
 
-                // Attempt 1: Poppler pdftotext executable
-                $resumeText = tryPdfToText($file['tmp_name']);
+                // Check if browser-extracted text is provided via POST
+                if (isset($_POST['extracted_text']) && strlen(trim($_POST['extracted_text'])) > 20) {
+                    $resumeText = $_POST['extracted_text'];
+                } else {
+                    // Attempt 1: Poppler pdftotext executable
+                    $resumeText = tryPdfToText($file['tmp_name']);
 
-                // Attempt 2: Pure-PHP fallback
-                if (strlen(trim($resumeText)) < 20) {
-                    $resumeText = extractTextFromPdf($file['tmp_name']);
+                    // Attempt 2: Pure-PHP fallback
+                    if (strlen(trim($resumeText)) < 20) {
+                        $resumeText = extractTextFromPdf($file['tmp_name']);
+                    }
                 }
 
                 // Clean control characters (like form-feeds \x0C) while keeping tab, LF, CR
@@ -868,6 +873,8 @@ $scoreLabel = get_score_label($atsScore);
     <meta name="description" content="Upload your PDF resume to get an instant ATS benchmark score, engineering archetype, and impact bullet analysis.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Google+Sans+Display:wght@400;700&family=Roboto:wght@400;500&display=swap" rel="stylesheet">
+    <!-- PDF.js library for client-side PDF text extraction -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
     <style>
         /* ── Gemini Light Design Tokens ── */
         :root {
@@ -1420,6 +1427,7 @@ $scoreLabel = get_score_label($atsScore);
         <?php endif; ?>
 
         <form action="" method="POST" enctype="multipart/form-data" id="resume-form">
+            <input type="hidden" name="extracted_text" id="extracted-text-input">
             <div class="upload-zone" id="drop-zone">
                 <input type="file" name="resume_pdf" id="pdf-input" accept=".pdf,application/pdf" required>
                 <div class="upload-icon-wrap">
@@ -1842,9 +1850,61 @@ $scoreLabel = get_score_label($atsScore);
     zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
     ['dragleave','dragend','drop'].forEach(ev => zone.addEventListener(ev, () => zone.classList.remove('drag-over')));
 
-    form.addEventListener('submit', () => {
-        btn.textContent = '⏳ Analysing...';
+    // Configure PDF.js worker
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+    form.addEventListener('submit', async (e) => {
+        // If we already extracted the text and set it, let the form submit normally
+        if (document.getElementById('extracted-text-input').value.length > 20) {
+            return;
+        }
+
+        e.preventDefault();
+        btn.textContent = '⏳ Reading PDF locally...';
         btn.disabled = true;
+
+        const file = input.files[0];
+        if (!file) {
+            alert('Please select a PDF file.');
+            btn.textContent = '✦   Scan & Categorize Resume';
+            btn.disabled = false;
+            return;
+        }
+
+        try {
+            const reader = new FileReader();
+            reader.onload = async function() {
+                try {
+                    const typedarray = new Uint8Array(this.result);
+                    const pdf = await pdfjsLib.getDocument({ data: typedarray }).promise;
+                    let fullText = '';
+                    
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const textContent = await page.getTextContent();
+                        const pageText = textContent.items.map(item => item.str).join(' ');
+                        fullText += pageText + '\n';
+                    }
+
+                    if (fullText.trim().length > 20) {
+                        document.getElementById('extracted-text-input').value = fullText;
+                        btn.textContent = '⏳ Analyzing...';
+                        form.submit();
+                    } else {
+                        throw new Error('No text content found in PDF.');
+                    }
+                } catch (err) {
+                    console.error('Browser PDF extraction failed, falling back to server:', err);
+                    btn.textContent = '⏳ Analyzing (Server Fallback)...';
+                    form.submit();
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        } catch (err) {
+            console.error('File reading failed, falling back to server:', err);
+            btn.textContent = '⏳ Analyzing (Server Fallback)...';
+            form.submit();
+        }
     });
 
     // Score breakdown bar-row expander logic
