@@ -646,29 +646,51 @@ function parseEducation(string $eduText): array {
         $line = trim($line);
         if (empty($line)) continue;
 
-        $isDegree = preg_match('/\b(Master|Bachelor|M\.S\.|B\.S\.|B\.A\.|M\.A\.|B\.Sc\.|M\.Sc\.|B\.E\.|B\.Tech|Degree|Diploma|Graduate)\b/i', $line);
-        $isUni = preg_match('/\b(University|College|Institute|School|Academy|Polytechnic)\b/i', $line);
-        $hasGpa = preg_match('/\b(GPA|Grade|Score|Marks|CGPA)\b/i', $line) || preg_match('/\b[0-3]\.\d+\s*\/|4\.\d+\b/i', $line);
+        // Check if there is a GPA in the line
+        $gpa = '';
+        if (preg_match('/\b(?:GPA|Grade|Score|Marks|CGPA)?\b\s*\(?\s*([0-4]\.\d+\s*(?:\/\s*4(?:\.0)?)?)\s*\)?/i', $line, $gm)) {
+            $gpa = $gm[0];
+            // Remove GPA substring from the line for degree/uni matching
+            $lineCleaned = trim(str_replace($gpa, '', $line), " \t\n\r\0\x0B(),");
+        } else {
+            $lineCleaned = $line;
+        }
+
+        $isDegree = preg_match('/\b(Master|Bachelor|M\.S\.|B\.S\.|B\.A\.|M\.A\.|B\.Sc\.|M\.Sc\.|B\.E\.|B\.Tech|Degree|Diploma|Graduate|Engineering|Science|Arts|Business)\b/i', $lineCleaned);
+        $isUni = preg_match('/\b(University|College|Institute|School|Academy|Polytechnic|State)\b/i', $lineCleaned);
 
         if ($isDegree) {
             if ($currentDegree) {
                 $degrees[] = $currentDegree;
             }
-            $currentDegree = ['course' => $line, 'university' => '', 'grade' => ''];
+            $currentDegree = [
+                'course' => $lineCleaned,
+                'university' => '',
+                'grade' => $gpa
+            ];
         } elseif ($isUni) {
             if (!$currentDegree) {
-                $currentDegree = ['course' => 'Degree / Course Not Specified', 'university' => $line, 'grade' => ''];
+                $currentDegree = [
+                    'course' => 'Degree / Course Not Specified',
+                    'university' => $lineCleaned,
+                    'grade' => $gpa
+                ];
             } else {
-                $currentDegree['university'] = $line;
-            }
-        } elseif ($hasGpa) {
-            if ($currentDegree) {
-                $currentDegree['grade'] = $line;
+                $currentDegree['university'] = $lineCleaned;
+                if (!empty($gpa)) {
+                    $currentDegree['grade'] = $gpa;
+                }
             }
         } else {
-            if ($currentDegree) {
-                if (empty($currentDegree['university'])) {
-                    $currentDegree['university'] = $line;
+            if (!empty($gpa)) {
+                if ($currentDegree) {
+                    $currentDegree['grade'] = $gpa;
+                }
+            } else {
+                if ($currentDegree) {
+                    if (empty($currentDegree['university'])) {
+                        $currentDegree['university'] = $lineCleaned;
+                    }
                 }
             }
         }
