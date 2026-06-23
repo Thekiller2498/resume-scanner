@@ -1046,12 +1046,17 @@ function calculateEducationScore(array $parsedEdu, array $parsedCert, int $tenur
         $isRelevant = isMajorRelevant($bestPhd['course'], $field, $role);
         $gpa = $bestPhd['gpa'];
 
+        // PhD GPA bounds: Min = 18 (at GPA 2.1), Max = 20 (at GPA 3.5) if relevant
+        // PhD GPA bounds (irrelevant): Min = 15, Max = 18
+        $gpaBounded = max(2.1, min(3.5, $gpa ?? 2.5));
+        $fraction = ($gpaBounded - 2.1) / (3.5 - 2.1);
+
         if ($isRelevant) {
-            $baseScore = ($gpa !== null && $gpa >= 3.5) ? 20 : 18;
-            $audit[] = "Relevant PhD detected (GPA: " . ($gpa ?? 'N/A') . "). Scored $baseScore points.";
+            $baseScore = 18 + ($fraction * (20 - 18));
+            $audit[] = "Relevant PhD detected (GPA: " . ($gpa ?? 'N/A') . "). Interpolated score: " . round($baseScore, 2) . " points.";
         } else {
-            $baseScore = ($gpa !== null && $gpa >= 3.5) ? 18 : 15;
-            $audit[] = "PhD detected in irrelevant field (GPA: " . ($gpa ?? 'N/A') . "). Scored $baseScore points.";
+            $baseScore = 15 + ($fraction * (18 - 15));
+            $audit[] = "PhD detected in irrelevant field (GPA: " . ($gpa ?? 'N/A') . "). Interpolated score: " . round($baseScore, 2) . " points.";
         }
         $selectedDegreeInfo = "PhD in " . $bestPhd['course'];
     }
@@ -1065,12 +1070,17 @@ function calculateEducationScore(array $parsedEdu, array $parsedCert, int $tenur
         } else {
             $level = 'masters';
             $isRelevant = isMajorRelevant($bestMaster['course'], $field, $role);
+            $gpaBounded = max(2.1, min(3.5, $gpa ?? 2.5));
+            $fraction = ($gpaBounded - 2.1) / (3.5 - 2.1);
+
             if ($isRelevant) {
-                $baseScore = ($gpa !== null && $gpa >= 3.5) ? 20 : 10;
-                $audit[] = "Relevant Masters detected (GPA: " . ($gpa ?? 'N/A') . "). Scored $baseScore points.";
+                // Masters Relevant: Min = 10 (at GPA 2.1), Max = 20 (at GPA 3.5)
+                $baseScore = 10 + ($fraction * (20 - 10));
+                $audit[] = "Relevant Masters detected (GPA: " . ($gpa ?? 'N/A') . "). Interpolated score: " . round($baseScore, 2) . " points.";
             } else {
-                $baseScore = 10; // Irrelevant field maxes/earns exactly 10
-                $audit[] = "Irrelevant Masters detected (GPA: " . ($gpa ?? 'N/A') . "). Scored $baseScore points.";
+                // Masters Irrelevant: Earns exactly 10 regardless of GPA/relevance
+                $baseScore = 10;
+                $audit[] = "Irrelevant Masters detected (GPA: " . ($gpa ?? 'N/A') . "). Scored exactly 10 points.";
             }
             $selectedDegreeInfo = "Masters in " . $bestMaster['course'];
         }
@@ -1086,12 +1096,17 @@ function calculateEducationScore(array $parsedEdu, array $parsedCert, int $tenur
         } else {
             $level = 'bachelors';
             $isRelevant = isMajorRelevant($bestBach['course'], $field, $role);
+            $gpaBounded = max(2.1, min(3.5, $gpa ?? 2.5));
+            $fraction = ($gpaBounded - 2.1) / (3.5 - 2.1);
+
             if ($isRelevant) {
-                $baseScore = ($gpa !== null && $gpa >= 3.5) ? 15 : 8;
-                $audit[] = "Relevant Bachelors detected (GPA: " . ($gpa ?? 'N/A') . "). Scored $baseScore points.";
+                // Bachelors Relevant: Min = 8 (at GPA 2.1), Max = 15 (at GPA 3.5)
+                $baseScore = 8 + ($fraction * (15 - 8));
+                $audit[] = "Relevant Bachelors detected (GPA: " . ($gpa ?? 'N/A') . "). Interpolated score: " . round($baseScore, 2) . " points.";
             } else {
-                $baseScore = 10; // Irrelevant field can only earn 10, minimum 8 regardless
-                $audit[] = "Irrelevant Bachelors detected (GPA: " . ($gpa ?? 'N/A') . "). Scored 10 points.";
+                // Bachelors Irrelevant: can only earn 10, minimum 8. So Min = 8, Max = 10
+                $baseScore = 8 + ($fraction * (10 - 8));
+                $audit[] = "Irrelevant Bachelors detected (GPA: " . ($gpa ?? 'N/A') . "). Interpolated score: " . round($baseScore, 2) . " points.";
             }
             $selectedDegreeInfo = "Bachelors in " . $bestBach['course'];
         }
@@ -1141,6 +1156,13 @@ function calculateEducationScore(array $parsedEdu, array $parsedCert, int $tenur
             $freshYear = $maxYear;
             $audit[] = "Education considered is fresh (Graduation year: $maxYear, under 4 years old). Weight increased to 30 points.";
         }
+    }
+
+    // If education weight is increased to 30 points, points in education are multiplied by 1.5 and rounded
+    if ($isFreshEdu) {
+        $originalBase = $baseScore;
+        $baseScore = round($baseScore * 1.5);
+        $audit[] = "Fresh graduation detected: points multiplied by 1.5 and rounded ($originalBase -> $baseScore).";
     }
 
     // 3. Experienced Candidate modifier (> 5 years tenure)
