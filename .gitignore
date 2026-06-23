@@ -10,3 +10,4 @@ test_runner.php
 test_scoring.php
 diag.php
 diag_pure.php
+.vscode/
